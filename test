@@ -1,0 +1,115 @@
+'use strict';
+
+var test = require('node:test');
+var assert = require('node:assert/strict');
+var pricing = require('./lib/pricing');
+var tax = require('./lib/tax');
+var invoice = require('./lib/invoice');
+
+test('invoice figures match checkout totals and per-line GST for the billed order', function () {
+  var items = [
+    { id: 1, name: 'Rice', hsn: '1006', price: 100, qty: 2 },
+    { id: 2, name: 'Tea', hsn: '0902', price: 100, qty: 1 }
+  ];
+  var checkout = pricing.computeTotals(items, 'WELCOME');
+  var billedOrder = {
+    items: items,
+    coupon: 'WELCOME',
+    subtotal: checkout.subtotal,
+    discount: checkout.discount,
+    tax: checkout.tax,
+    total: checkout.total
+  };
+
+  assert.deepEqual(invoice.computeInvoiceFigures(billedOrder), {
+    subtotal: checkout.subtotal,
+    discount: checkout.discount,
+    tax: checkout.tax,
+    cgst: checkout.cgst,
+    sgst: checkout.sgst,
+    total: checkout.total,
+    rows: [
+      { name: 'Rice', sku: '-', hsn: '1006', qty: 2, price: 100, gstPercent: 5, line: 200, lineTax: 9.5 },
+      { name: 'Tea', sku: '-', hsn: '0902', qty: 1, price: 100, gstPercent: 18, line: 100, lineTax: 17.1 }
+    ]
+  });
+  var rendered = invoice.render(billedOrder);
+  assert.match(rendered, /Invoice Total<\/td><td class="r">₹311\.60/);
+  assert.doesNotMatch(rendered, /Accountant Reconciliation Notice/);
+});
+
+test('CURRENT BEHAVIOUR: checkout applies HSN GST after allocating coupon discount', function () {
+  var items = [
+    { id: 1, name: 'Rice', hsn: '1006', price: 100, qty: 2 },
+    { id: 2, name: 'Tea', hsn: '0902', price: 100, qty: 1 }
+  ];
+
+  assert.deepEqual(pricing.computeTotals(items, 'WELCOME'), {
+    subtotal: 300,
+    discount: 15,
+    taxable: 285,
+    tax: 26.6,
+    cgst: 13.3,
+    sgst: 13.3,
+    total: 311.6,
+    lines: [
+      { id: 1, name: 'Rice', hsn: '1006', gstPercent: 5, gross: 200, discount: 10, taxable: 190, tax: 9.5, net: 199.5 },
+      { id: 2, name: 'Tea', hsn: '0902', gstPercent: 18, gross: 100, discount: 5, taxable: 95, tax: 17.1, net: 112.1 }
+    ]
+  });
+});
+
+test('invoice uses HSN slabs when reconstructing the order GST', function () {
+  var order = {
+    items: [
+      { name: 'Rice', hsn: '1006', price: 200, qty: 2 },
+      { name: 'Tea', hsn: '0902', price: 100, qty: 1 }
+    ],
+    coupon: ''
+  };
+
+  var figures = invoice.computeInvoiceFigures(order);
+  assert.equal(figures.subtotal, 500);
+  assert.equal(figures.tax, 38);
+  assert.equal(figures.cgst, 19);
+  assert.equal(figures.sgst, 19);
+  assert.equal(figures.total, 538);
+  assert.deepEqual(figures.rows.map(function (row) { return row.gstPercent; }), [5, 18]);
+});
+
+test('invoice coupon discount follows checkout cap and is applied before GST', function () {
+  var order = {
+    items: [{ name: 'Rice', hsn: '1006', price: 500, qty: 1 }],
+    coupon: 'WELCOME'
+  };
+
+  // Checkout applies this 5% coupon against the subtotal, then taxes the reduced value.
+  assert.equal(pricing.computeTotals(order.items, 'WELCOME').discount, 25);
+  var figures = invoice.computeInvoiceFigures(order);
+  assert.equal(figures.tax, 23.75);
+  assert.equal(figures.discount, 25);
+  assert.equal(figures.total, 498.75);
+});
+
+test('invoice handles decimal GST rates like checkout', function () {
+  var item = { gstRate: 0.05 };
+  assert.equal(tax.getRateForItem(item), 0.05);
+  assert.equal(tax.getSlabPercent(item), 5);
+
+  var figures = invoice.computeInvoiceFigures({
+    items: [{ name: 'Special', price: 100, qty: 1, gstRate: 0.05 }]
+  });
+  assert.equal(figures.rows[0].gstPercent, 5);
+  assert.equal(figures.tax, 5);
+  assert.equal(figures.total, 105);
+});
+
+test('invoice GST split matches the tax module paise rounding', function () {
+  assert.deepEqual(tax.splitCgstSgst(0.01), { cgst: 0.01, sgst: 0 });
+  var figures = invoice.computeInvoiceFigures({
+    items: [{ name: 'Tiny taxable line', price: 0.03, qty: 1, gstRate: 18 }]
+  });
+  assert.equal(figures.tax, 0.01);
+  assert.equal(figures.cgst, 0.01);
+  assert.equal(figures.sgst, 0);
+});
